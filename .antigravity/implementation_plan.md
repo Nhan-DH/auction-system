@@ -381,13 +381,14 @@ Mỗi message là JSON, được đóng gói với length-prefix:
 | `LIST_ROOMS` | `{token}` | Liệt kê phòng |
 | `JOIN_ROOM` | `{token, room_id}` | Tham gia phòng |
 | `LEAVE_ROOM` | `{token}` | Rời phòng |
-| `ADD_ITEM` | `{token, room_id, name, desc, starting_price, buy_now_price, duration}` | Thêm vật phẩm |
-| `DELETE_ITEM` | `{token, item_id}` | Xóa vật phẩm |
-| `START_AUCTION` | `{token, room_id}` | Bắt đầu đấu giá item tiếp theo trong queue |
+| `ADD_ITEM` | `{token, room_id, name, desc, starting_price, buy_now_price, duration}` | Thêm vật phẩm vào hàng đợi |
+| `DELETE_ITEM` | `{token, item_id}` | Xóa vật phẩm khỏi hàng đợi |
+| `REORDER_ITEM` | `{token, item_id, new_position}` | Sắp xếp lại thứ tự item trong hàng đợi (chủ phòng) |
+| `START_AUCTION` | `{token, room_id}` | Bắt đầu đấu giá item tiếp theo trong queue (giới thiệu → đấu giá) |
 | `PLACE_BID` | `{token, auction_id, amount}` | Đặt giá |
 | `BUY_NOW` | `{token, auction_id}` | Mua ngay |
-| `LIST_ITEMS` | `{token, room_id, status_filter}` | Xem vật phẩm theo trạng thái |
-| `SEARCH_ITEMS` | `{token, keyword, time_from, time_to}` | Tìm kiếm vật phẩm |
+| `LIST_ITEMS` | `{token, room_id, status_filter}` | Xem vật phẩm theo trạng thái: `pending` (sắp đấu giá), `active` (đang đấu giá), `ended` (đã đấu giá: sold/unsold) |
+| `SEARCH_ITEMS` | `{token, keyword, time_from, time_to, status_filter}` | Tìm kiếm vật phẩm theo thông tin hoặc khung giờ đấu giá. Response trả kèm `room_id` để client có thể JOIN_ROOM |
 | `MY_STATS` | `{token}` | Xem thống kê cá nhân |
 
 #### Server → Client (Response / Notification)
@@ -395,10 +396,11 @@ Mỗi message là JSON, được đóng gói với length-prefix:
 | Action | Payload | Mô tả |
 |--------|---------|-------|
 | `RESPONSE` | `{status, action, data, error}` | Phản hồi cho request |
-| `AUCTION_STARTED` | `{auction_id, item, starting_price, end_time}` | Phiên đấu giá bắt đầu |
-| `NEW_BID` | `{auction_id, bidder, amount, time_remaining}` | Có giá mới |
-| `TIME_WARNING` | `{auction_id, seconds_remaining}` | Cảnh báo sắp hết giờ (30s) |
-| `TIME_RESET` | `{auction_id, new_end_time, seconds_remaining}` | Reset thời gian về 30s |
+| `ITEM_PREVIEW` | `{item, starting_price, buy_now_price, duration}` | Giới thiệu vật phẩm sắp đấu giá (trước khi timer chạy) |
+| `AUCTION_STARTED` | `{auction_id, item, starting_price, end_time}` | Phiên đấu giá chính thức bắt đầu (timer bắt đầu chạy) |
+| `NEW_BID` | `{auction_id, bidder, amount, time_remaining}` | Có giá mới — broadcast đến tất cả thành viên phòng |
+| `TIME_WARNING` | `{auction_id, seconds_remaining}` | Cảnh báo sắp hết giờ (còn 30s) — gửi đến tất cả |
+| `TIME_RESET` | `{auction_id, new_end_time, seconds_remaining}` | Reset thời gian về 30s (do có bid mới trong 30s cuối) |
 | `AUCTION_ENDED` | `{auction_id, winner, final_price, item}` | Kết thúc đấu giá |
 | `BUY_NOW_SUCCESS` | `{auction_id, buyer, price, item}` | Mua ngay thành công |
 | `USER_JOINED` | `{room_id, user}` | Người dùng vào phòng |
@@ -524,6 +526,14 @@ sequenceDiagram
 
     Owner->>S: START_AUCTION (room_id)
     S->>S: Lấy item đầu tiên trong queue (status=pending)
+    
+    Note over S: Giai đoạn 1: Giới thiệu vật phẩm
+    S-->>Owner: ITEM_PREVIEW {item, starting_price, buy_now_price, duration}
+    S-->>B1: ITEM_PREVIEW
+    S-->>B2: ITEM_PREVIEW
+    Note over S: Chờ vài giây để mọi người xem thông tin
+    
+    Note over S: Giai đoạn 2: Bắt đầu đấu giá
     S->>S: Tạo auction record, set timer
     S-->>Owner: AUCTION_STARTED {item, starting_price, end_time}
     S-->>B1: AUCTION_STARTED
@@ -574,6 +584,51 @@ sequenceDiagram
     S->>S: Ghi bid record (is_buy_now = true)
     S-->>Buyer: BUY_NOW_SUCCESS {price, item}
     S-->>Others: AUCTION_ENDED {winner: Buyer, price: buy_now_price, is_buy_now: true}
+```
+
+### 6.4. Tìm Kiếm → Tham Gia Phòng
+
+```mermaid
+sequenceDiagram
+    participant C as Client (React)
+    participant S as C Server
+    participant D as PostgreSQL
+
+    C->>S: SEARCH_ITEMS {keyword: "laptop", time_from, time_to, status_filter: "active"}
+    S->>D: SELECT items.*, rooms.id, rooms.name FROM items JOIN rooms...
+    D-->>S: Danh sách items + room info
+    S-->>C: RESPONSE {items: [{name, room_id, room_name, status, price, ...}]}
+    
+    Note over C: User thấy item đang đấu giá → click "Tham gia phòng"
+    C->>S: JOIN_ROOM {room_id: 5}
+    S->>S: Kiểm tra user chưa ở phòng nào (hoặc rời phòng cũ)
+    S->>D: INSERT room_members / UPDATE is_active
+    S-->>C: RESPONSE {status: "ok", room_id: 5}
+    Note over C: Chuyển sang trang phòng đấu giá → xem/đấu giá
+```
+
+### 6.5. Xem Vật Phẩm Theo Trạng Thái
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as C Server
+    participant D as PostgreSQL
+
+    Note over C: Tab "Sắp đấu giá"
+    C->>S: LIST_ITEMS {room_id: 5, status_filter: "pending"}
+    S->>D: SELECT * FROM items WHERE room_id=5 AND status='pending' ORDER BY queue_order
+    S-->>C: RESPONSE {items: [{name, starting_price, queue_order, ...}]}
+
+    Note over C: Tab "Đang diễn ra"
+    C->>S: LIST_ITEMS {room_id: 5, status_filter: "active"}
+    S->>D: SELECT items.*, auctions.current_price, auctions.current_winner_id FROM items JOIN auctions...
+    S-->>C: RESPONSE {items: [{name, current_price, current_winner, time_remaining, ...}]}
+
+    Note over C: Tab "Đã kết thúc"
+    C->>S: LIST_ITEMS {room_id: 5, status_filter: "ended"}
+    S->>D: SELECT items.*, auctions.* FROM items JOIN auctions WHERE status IN ('sold','unsold')
+    S-->>C: RESPONSE {items: [{name, final_price, winner, status, ...}]}
 ```
 
 ---
@@ -768,14 +823,18 @@ wss.on('connection', (ws) => {
 | Liệt kê phòng đấu giá | 1 | `room_handler.c` | LIST_ROOMS |
 | Tạo vật phẩm đấu giá | 2 | `item_handler.c` | ADD_ITEM với queue |
 | Xóa vật phẩm trong phòng | 1 | `item_handler.c` | DELETE_ITEM |
+| Sắp xếp hàng đợi vật phẩm | 1 | `item_handler.c` | REORDER_ITEM |
+| Xem vật phẩm theo 3 trạng thái | 1 | `item_handler.c` | LIST_ITEMS (pending/active/ended) |
 | Tham gia phòng đấu giá | 2 | `room_handler.c` | JOIN_ROOM (enforce 1 room/user) |
+| Tìm kiếm + join phòng | 2 | `search_handler.c` | SEARCH_ITEMS + room_id trong response |
 | Tố giá | 2 | `auction_handler.c` | PLACE_BID (>= current + 10000) |
 | Mua trực tiếp | 1 | `auction_handler.c` | BUY_NOW |
+| Giới thiệu vật phẩm trước đấu giá | 1 | `auction_engine.c` | ITEM_PREVIEW broadcast |
 | Ghi log hoạt động | 1 | `logger.c` | INSERT activity_logs |
 | Thông báo + reset timer | 2 | `timer.c`, `notification.c` | 30s warning + reset |
 | Giao diện đồ họa | 3 | `client/` (React) | Full React UI |
 | Chức năng nâng cao | 2-10 | Xem mục 10 | Chat, thống kê, hình ảnh... |
-| **Tổng** | **≥ 26** | | |
+| **Tổng** | **≥ 29** | | |
 
 ---
 
@@ -836,21 +895,23 @@ wss.on('connection', (ws) => {
 ### Phase 3: Auction Core (Tuần 3)
 11. Thêm vật phẩm vào hàng đợi
 12. Xóa vật phẩm
-13. Bắt đầu đấu giá (lấy item đầu queue)
-14. Đặt giá (bid validation ≥ 10000)
-15. Timer: cảnh báo 30s + reset
-16. Mua ngay (buy now)
-17. Kết thúc đấu giá + broadcast
+13. Sắp xếp lại hàng đợi (REORDER_ITEM)
+14. Xem vật phẩm theo 3 trạng thái (LIST_ITEMS: pending/active/ended)
+15. Bắt đầu đấu giá: giới thiệu item (ITEM_PREVIEW) → bắt đầu timer (AUCTION_STARTED)
+16. Đặt giá (bid validation ≥ 10000)
+17. Timer: cảnh báo 30s + reset
+18. Mua ngay (buy now)
+19. Kết thúc đấu giá + broadcast
 
 ### Phase 4: Frontend (Tuần 4)
-18. Setup React + Vite
-19. WebSocket proxy (Node.js)
-20. Trang đăng nhập / đăng ký
-21. Trang danh sách phòng
-22. Trang phòng đấu giá (realtime)
-23. Panel đặt giá + countdown timer
-24. Tìm kiếm vật phẩm
-25. Trang thống kê
+20. Setup React + Vite
+21. WebSocket proxy (Node.js)
+22. Trang đăng nhập / đăng ký
+23. Trang danh sách phòng + indicator phòng đang tham gia
+24. Trang phòng đấu giá (realtime) + 3 tabs vật phẩm (đã/đang/sắp)
+25. Panel đặt giá + countdown timer
+26. Tìm kiếm vật phẩm + nút "Tham gia phòng" trong kết quả
+27. Trang thống kê
 
 ### Phase 5: Polish & Advanced (Tuần 5)
 26. Chat trong phòng
