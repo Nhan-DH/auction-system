@@ -50,12 +50,12 @@ Server phải phục vụ **nhiều client đồng thời**. Có 3 cách:
 | **`select()`** | Kiểm tra nhiều socket cùng lúc | Portable, giới hạn FD_SETSIZE |
 | **`epoll()`** (Linux) | Event-driven I/O | Hiệu năng cao, chỉ chạy trên Linux |
 
-**Trong project này**, ta dùng kết hợp: **`epoll()` (hoặc `select()`) + thread pool**:
+**Trong project này**, ta dùng **`select()`** (cross-platform, chạy được trên Windows lẫn Linux):
 
 ```
                     ┌─────────────────────────────────┐
                     │          Main Thread             │
-                    │    epoll_wait() / select()       │
+                    │         select()                 │
                     │  Lắng nghe sự kiện trên tất      │
                     │  cả socket (new conn + data)     │
                     └────────────┬────────────────────┘
@@ -90,10 +90,10 @@ Vì server C dùng raw TCP socket, React (chạy trên browser) **không thể k
                                                            └─────────────┘
 ```
 
-**WebSocket Proxy** (Node.js nhỏ) làm cầu nối giữa WebSocket của browser và TCP socket của C server. Hoặc thay thế, ta có thể thêm **thư viện WebSocket vào C server** (dùng `libwebsockets`) để React kết nối trực tiếp.
+**WebSocket Proxy** (Node.js nhỏ) làm cầu nối giữa WebSocket của browser và TCP socket của C server.
 
-> [!IMPORTANT]
-> **Quyết định cần lựa chọn**: Dùng **WebSocket Proxy (Node.js)** hay tích hợp **libwebsockets vào C server**? Proxy đơn giản hơn nhưng thêm 1 layer. Tích hợp trực tiếp phức tạp hơn nhưng gọn.
+> [!NOTE]
+> **Quyết định đã chọn**: Dùng **WebSocket Proxy (Node.js)** — đơn giản hơn, dễ debug, tách biệt concerns giữa WebSocket handling và business logic.
 
 ---
 
@@ -112,7 +112,7 @@ graph TB
     end
 
     subgraph "Backend - C Server"
-        MAIN[Main Loop<br/>epoll/select]
+        MAIN[Main Loop<br/>select]
         AUTH[Auth Handler]
         ROOM[Room Manager]
         AUCTION[Auction Engine]
@@ -414,7 +414,7 @@ auction-system/
 │   ├── CMakeLists.txt               # Build system
 │   ├── src/
 │   │   ├── main.c                   # Entry point, khởi tạo server
-│   │   ├── server.c/h               # Main event loop (epoll/select)
+│   │   ├── server.c/h               # Main event loop (select)
 │   │   ├── network/
 │   │   │   ├── socket_handler.c/h   # Accept, read, write socket
 │   │   │   ├── message.c/h          # Đóng gói/giải mã message (framing)
@@ -583,24 +583,39 @@ sequenceDiagram
 ### 7.1. Server Core — Event Loop (`server.c`)
 
 ```c
-// Pseudo-code cho main event loop
-void server_run(int listen_fd) {
-    int epoll_fd = epoll_create1(0);
-    epoll_add(epoll_fd, listen_fd, EPOLLIN);
+// Pseudo-code cho main event loop dùng select() — cross-platform (Windows + Linux)
+void server_run(SOCKET listen_fd) {
+    fd_set master_set, read_set;
+    FD_ZERO(&master_set);
+    FD_SET(listen_fd, &master_set);
+    int max_fd = listen_fd;
 
     while (running) {
-        int n = epoll_wait(epoll_fd, events, MAX_EVENTS, 100); // timeout 100ms
+        read_set = master_set;  // copy vì select() sẽ modify
+        struct timeval timeout = { .tv_sec = 0, .tv_usec = 100000 }; // 100ms
 
-        for (int i = 0; i < n; i++) {
-            if (events[i].data.fd == listen_fd) {
+        int ready = select(max_fd + 1, &read_set, NULL, NULL, &timeout);
+        if (ready < 0) { perror("select"); break; }
+
+        for (int fd = 0; fd <= max_fd; fd++) {
+            if (!FD_ISSET(fd, &read_set)) continue;
+
+            if (fd == listen_fd) {
                 // New connection
-                int client_fd = accept(listen_fd, ...);
+                SOCKET client_fd = accept(listen_fd, ...);
                 set_nonblocking(client_fd);
-                epoll_add(epoll_fd, client_fd, EPOLLIN);
+                FD_SET(client_fd, &master_set);
+                if (client_fd > max_fd) max_fd = client_fd;
                 client_list_add(client_fd);
             } else {
                 // Data from existing client
-                handle_client_data(events[i].data.fd);
+                int result = handle_client_data(fd);
+                if (result < 0) {
+                    // Client disconnected
+                    FD_CLR(fd, &master_set);
+                    closesocket(fd);
+                    client_list_remove(fd);
+                }
             }
         }
 
@@ -609,6 +624,9 @@ void server_run(int listen_fd) {
     }
 }
 ```
+
+> [!NOTE]
+> Trên Windows, dùng `SOCKET` type thay vì `int` cho file descriptors, và cần gọi `WSAStartup()` trước khi dùng socket API. `select()` trên Windows có giới hạn `FD_SETSIZE = 64` mặc định, có thể tăng bằng `#define FD_SETSIZE 1024` trước khi include `<winsock2.h>`.
 
 ### 7.2. Auction Engine — Timer Management (`timer.c`)
 
@@ -742,7 +760,7 @@ wss.on('connection', (ws) => {
 | Yêu cầu | Điểm | Module/File | Ghi chú |
 |----------|-------|-------------|---------|
 | Xử lý truyền dòng | 1 | `message.c` | Length-prefix framing + `recv_exact()` |
-| Socket I/O trên server | 2 | `server.c` | epoll/select event loop |
+| Socket I/O trên server | 2 | `server.c` | `select()` event loop (cross-platform) |
 | Đăng ký & quản lý tài khoản | 2 | `auth_handler.c` | Register + password hash |
 | Đăng nhập & quản lý phiên | 2 | `auth_handler.c` | Login + session token |
 | Kiểm soát quyền truy cập phòng | 1 | `room_handler.c` | Check membership |
@@ -782,7 +800,7 @@ wss.on('connection', (ws) => {
 | **libpq** | Kết nối PostgreSQL | `apt install libpq-dev` |
 | **cJSON** | Parse/generate JSON | Copy source trực tiếp (header-only) |
 | **OpenSSL** | Hash password (SHA-256) | `apt install libssl-dev` |
-| **pthread** | Multi-threading | Built-in trên Linux |
+| **pthread / Win threads** | Multi-threading (nếu cần) | Built-in (Linux: pthread, Windows: CreateThread) |
 
 ### Node.js Proxy
 | Package | Mục đích |
@@ -843,15 +861,14 @@ wss.on('connection', (ws) => {
 
 ---
 
+## Quyết Định Đã Chốt
+
+| # | Câu hỏi | Quyết định |
+|---|---------|------------|
+| 1 | I/O Multiplexing | **`select()`** — cross-platform (Windows + Linux) |
+| 2 | Browser ↔ C Server | **WebSocket Proxy (Node.js)** — tách biệt concerns, dễ debug |
+
 ## Open Questions
-
-> [!IMPORTANT]
-> **Câu hỏi 1**: Bạn sẽ chạy project trên **Linux** hay **Windows**? Điều này quyết định dùng `epoll()` (Linux) hay `select()` (cross-platform) cho I/O multiplexing.
-
-> [!IMPORTANT]
-> **Câu hỏi 2**: Bạn muốn dùng **WebSocket Proxy (Node.js)** hay tích hợp **libwebsockets vào C server**?
-> - Proxy: Đơn giản hơn, dễ debug, tách biệt concerns
-> - Tích hợp: Gọn hơn, ít component, nhưng phức tạp hơn khi code C
 
 > [!NOTE]
 > **Câu hỏi 3**: Deadline của project là khi nào? Để tôi điều chỉnh scope phù hợp.
