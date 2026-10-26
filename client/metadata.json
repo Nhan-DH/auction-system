@@ -1,0 +1,6 @@
+{
+  "name": "Sàn Đấu Giá Trực Tuyến",
+  "description": "Hệ thống đấu giá trực tuyến thời gian thực với phòng đấu giá, cơ chế hàng đợi vật phẩm, tố giá socket real-time, reset 30s cuối và mua ngay.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
