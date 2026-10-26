@@ -1,0 +1,12 @@
+{
+  "name": "auction-ws-proxy",
+  "version": "1.0.0",
+  "description": "WebSocket to TCP bridge for Auction System",
+  "main": "proxy.js",
+  "scripts": {
+    "start": "node proxy.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
